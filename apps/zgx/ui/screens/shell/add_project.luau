@@ -5,7 +5,9 @@
 -- this Mac's too (no folder dialog). Under Home, what's typed also finds
 -- folders anywhere under it ("In Home", the engine's index). A path typed
 -- (`~/code`, `/mnt`; ⌘L starts from the folder's) goes there. A git address
--- typed in a folder offers to clone it there. Added (`createSpace`, named after its folder), the
+-- typed in a folder offers to clone it there; typed sooner (on the devices or
+-- a device's places), it offers that device, then its folders to pick where,
+-- "Clone here" first in each. Added (`createSpace`, named after its folder), the
 -- window lands in a new chat in it; a folder that's a project already just
 -- opens it.
 --
@@ -139,10 +141,14 @@ local function git_url(text: string): string?
 	return if owner and name then `{owner}/{name}` else nil
 end
 
+-- A repository to clone, chosen before its folder: its address and owner/name.
+type Clone = { url: string, repo: string }
+
 -- A folder on `device` (nil `path`: its home), as a page: "Add this folder",
 -- then the folders inside it. (`git`: whether it's a repository, as the
--- folder above listed it.)
-local folder_page: (device: string, path: string?, title: string, git: boolean, home: boolean) -> Page
+-- folder above listed it; `clone`: picking where a repository goes, "Clone
+-- here" in place of "Add this folder", all the way down.)
+local folder_page: (device: string, path: string?, title: string, git: boolean, home: boolean, clone: Clone?) -> Page
 
 -- Searching under a device's home (Zeron's "In Home"): its folders anywhere
 -- under it, through the engine's index. The first ask on Home starts the
@@ -297,7 +303,7 @@ local function leaf(text: string): (string, string)
 end
 
 -- A path typed: that folder, opened (↵) or added (⌘↵), wherever it is.
-local function go_to(device: string, query: string): any
+local function go_to(device: string, query: string, clone: Clone?): any
 	local typed = string.match(query, "^%s*(.-)%s*$") or query
 	local name = string.match((string.gsub(typed, "[/\\]+$", "")), "([^/\\]+)$") or typed
 	return {
@@ -308,9 +314,9 @@ local function go_to(device: string, query: string): any
 		keywords = query,
 		verb = locale.s("shell.add_project.open"),
 		page = function(): Page
-			return folder_page(device, typed, name, false, false)
+			return folder_page(device, typed, name, false, false, clone)
 		end,
-		alt = {
+		alt = if clone then nil else {
 			label = locale.s("shell.add_project.add_project"),
 			run = function()
 				resolve(device, typed, function(at: string?, why: any?)
@@ -335,7 +341,7 @@ end
 -- `/var/folders/`), as the page it goes to at once; a disk's root alone
 -- (`/`, `C:\`) waits for more (it's how any path starts), its "Go to" row
 -- there for ↵.
-local function jump(device: string, query: string): Page?
+local function jump(device: string, query: string, clone: Clone?): Page?
 	local q = string.match(query, "^%s*(.-)%s*$") or ""
 	local last = string.sub(q, -1)
 	if (last ~= "/" and last ~= "\\") or not typed_path(q) then
@@ -345,7 +351,7 @@ local function jump(device: string, query: string): Page?
 		return nil
 	end
 	local name = string.match(key_of(q), "([^/\\]+)$") or q
-	return folder_page(device, q, name, false, string.sub(q, 1, 1) == "~")
+	return folder_page(device, q, name, false, string.sub(q, 1, 1) == "~", clone)
 end
 -- A path typed, as the one row offered (a promise of it).
 local function offer(row: any): any
@@ -366,11 +372,13 @@ end
 -- How many of your GitHub repositories a folder's search offers to clone.
 local CLONE_MATCHES = 5
 
-folder_page = function(device: string, path: string?, title: string, git: boolean, home: boolean): Page
+folder_page = function(device: string, path: string?, title: string, git: boolean, home: boolean, clone: Clone?): Page
 	local page: Page = {
-		id = `folder:{device}:{path or "~"}`,
+		id = `folder:{device}:{path or "~"}{if clone then ":" .. clone.url else ""}`,
 		title = title,
-		placeholder = locale.s("shell.add_project.search_folders"),
+		placeholder = if clone
+			then locale.s("shell.add_project.clone_where", { repo = clone.repo })
+			else locale.s("shell.add_project.search_folders"),
 		loading = { title = locale.s("shell.add_project.loading_folders") },
 	}
 	local here: string? = path
@@ -393,6 +401,21 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 			end
 		end)
 	end
+	-- A repository cloned into this folder, then added.
+	local function clone_into(url: string, repo: string)
+		local parent = here
+		if not parent then
+			return
+		end
+		toast.show { title = locale.s("shell.add_project.cloning", { repo = repo }) }
+		projects.clone(device, url, parent :: string):after(function(cloned: any)
+			if type(cloned) == "table" and type(cloned.path) == "string" then
+				M.add(device, cloned.path, true)
+			end
+		end, function(err: any)
+			toast.show { title = locale.s("shell.add_project.couldnt_clone", { repo = repo }), body = says(err), tone = "danger" }
+		end)
+	end
 	page.load = function(done: ({ Item }) -> ())
 		list(function(listing: any)
 			here = if type(listing) == "table" and type(listing.path) == "string" then listing.path else path
@@ -405,7 +428,21 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 			-- (Typed, it may be a repository nobody said.)
 			git = git or has_git(listing)
 			local out: { Item } = {}
-			if here then
+			if here and clone then
+				local at, c = here :: string, clone :: Clone
+				local short = string.match(c.repo, "([^/]+)$") or c.repo
+				table.insert(out, {
+					id = "clone-here",
+					label = locale.s("shell.add_project.clone_here", { repo = c.repo }),
+					section = locale.s("shell.add_project.clone_section"),
+					icon = "git-branch",
+					hint = join(tilde(device, at), short),
+					verb = locale.s("shell.add_project.clone"),
+					run = function()
+						clone_into(c.url, c.repo)
+					end,
+				})
+			elseif here then
 				local at = here :: string
 				table.insert(out, {
 					id = "add-here",
@@ -436,10 +473,10 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 						icon = if repo then "git-branch" else "folder",
 						verb = locale.s("shell.add_project.open"),
 						page = function(): Page
-							return folder_page(device, child, e.name, repo, home)
+							return folder_page(device, child, e.name, repo, home, clone)
 						end,
 						-- (⌘↵: this one added, as it stands.)
-						alt = {
+						alt = if clone then nil else {
 							label = locale.s("shell.add_project.add_project"),
 							run = function()
 								M.add(device, child, repo)
@@ -479,7 +516,7 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 			if at and (q == at or key_of(q) == key_of(here :: string)) then
 				return nil
 			end
-			return jump(device, q)
+			return jump(device, q, clone)
 		end
 		local typed = string.sub(q, 1, -2)
 		if typed == "" or string.find(typed, "[/\\]") then
@@ -492,7 +529,7 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 			return nil
 		end
 		local dir = d :: Dir
-		return folder_page(device, join(here :: string, dir.name), dir.name, dir.repo, home)
+		return folder_page(device, join(here :: string, dir.name), dir.name, dir.repo, home, clone)
 	end
 	-- Tab: a folder's name completed (here's folders), its separator after,
 	-- so it goes in.
@@ -548,9 +585,9 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 									keywords = q,
 									verb = locale.s("shell.add_project.open"),
 									page = function(): Page
-										return folder_page(device, at, name, repo, true)
+										return folder_page(device, at, name, repo, true, clone)
 									end,
-									alt = {
+									alt = if clone then nil else {
 										label = locale.s("shell.add_project.add_project"),
 										run = function()
 											M.add(device, at, repo)
@@ -573,21 +610,6 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 				look()
 			end,
 		}
-	end
-	-- A repository cloned into this folder, then added.
-	local function clone_into(url: string, repo: string)
-		local parent = here
-		if not parent then
-			return
-		end
-		toast.show { title = locale.s("shell.add_project.cloning", { repo = repo }) }
-		projects.clone(device, url, parent :: string):after(function(cloned: any)
-			if type(cloned) == "table" and type(cloned.path) == "string" then
-				M.add(device, cloned.path, true)
-			end
-		end, function(err: any)
-			toast.show { title = locale.s("shell.add_project.couldnt_clone", { repo = repo }), body = says(err), tone = "danger" }
-		end)
 	end
 	-- Your GitHub repositories a name typed matches (Cloud's, GitHub
 	-- connected), a few, newest push first, to clone here (production's From
@@ -628,9 +650,9 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 		if not repo then
 			if typed_path(string.match(query, "^%s*(.-)%s*$") or "") then
 				asked += 1
-				return offer(go_to(device, query))
+				return offer(go_to(device, query, clone))
 			end
-			local github = from_github(query)
+			local github = if clone then {} else from_github(query)
 			local found = if home then in_home(query) else nil
 			if not found then
 				return if #github > 0 then offer_all(github) else nil
@@ -673,6 +695,26 @@ folder_page = function(device: string, path: string?, title: string, git: boolea
 	return page
 end
 
+-- A git address typed before a folder's chosen: cloned on `device`, into a
+-- folder picked next, from Home.
+local function clone_on(device: string, name: string, query: string): Item?
+	local repo = git_url(query)
+	if not repo then
+		return nil
+	end
+	local c: Clone = { url = string.match(query, "^%s*(.-)%s*$") or query, repo = repo :: string }
+	return {
+		id = `clone-on:{device}:{c.url}`,
+		label = locale.s("shell.add_project.clone_on", { repo = c.repo, device = name }),
+		section = locale.s("shell.add_project.clone_section"),
+		icon = "git-branch",
+		verb = locale.s("shell.add_project.choose_folder"),
+		page = function(): Page
+			return folder_page(device, nil, locale.s("shell.add_project.home"), false, true, c)
+		end,
+	}
+end
+
 -- A device's places to start from: Home, then its drives.
 local function locations_page(device: string, name: string): Page
 	local page: Page = {
@@ -688,7 +730,8 @@ local function locations_page(device: string, name: string): Page
 		if typed_path(string.match(query, "^%s*(.-)%s*$") or "") then
 			return offer(go_to(device, query))
 		end
-		return nil
+		local clone = clone_on(device, name, query)
+		return if clone then offer(clone) else nil
 	end
 	page.typed = function(query: string): Page?
 		return jump(device, query)
@@ -886,10 +929,29 @@ end
 
 local recent = ui.state("shell_add_project_recent", {} :: { string })
 
+-- A git address typed on the first step: cloned on any of your devices, this
+-- Mac first. (Not Cloud: its projects are its repositories already.)
+local function clone_anywhere(query: string): any
+	local out: { Item } = {}
+	local here_id = sessions.here:peek()
+	for _, d in sessions.computers(sessions.devices:peek()) do
+		local item = clone_on(d.id, d.name, query)
+		if not item then
+			return nil
+		end
+		if d.here or d.id == here_id then
+			table.insert(out, 1, item)
+		else
+			table.insert(out, item)
+		end
+	end
+	return if #out > 0 then offer_all(out) else nil
+end
+
 -- Its first step: your devices. (Its words read as they're drawn, the
 -- locale shown then: its palette's root is made once.)
 local function root(): Page
-	return setmetatable({ id = "new-project", items = devices }, {
+	return setmetatable({ id = "new-project", items = devices, search = clone_anywhere }, {
 		__index = function(_, field: string): any
 			if field == "title" then
 				return locale.s("shell.add_project.title")
